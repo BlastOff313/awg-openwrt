@@ -1,58 +1,25 @@
-# .github/workflows/ci.yml
-name: CI for AWG-OpenWRT
+# .github/workflows/create-release-on-tag.yml
+name: Create Release on Tag
 
 on:
   push:
+    # Автоотображение и автозапуск при пуше в master
     branches:
       - master
+    # Автозапуск при создании тега вида vX.Y.Z
     tags:
-      - 'v*.*.*'
+      - "v*.*.*"
+  # Ручной запуск из UI
   workflow_dispatch:
 
 jobs:
-  build-module:
-    name: Build Kernel Module
-    if: github.event_name == 'push' && contains(github.ref, 'refs/heads/master')
+  build:
+    name: "v${{ matrix.build_env.tag }} - ${{ matrix.build_env.pkgarch }} :: ${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }} build"
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
 
-      - name: Install deps
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential libncurses-dev libssl-dev flex bison rsync unzip
-
-      - name: Clone OpenWRT
-        run: |
-          git clone https://github.com/openwrt/openwrt.git openwrt-src
-          cd openwrt-src
-          ./scripts/feeds update -a && ./scripts/feeds install -a
-
-      - name: Copy config & defconfig
-        run: |
-          cp ../.config .config
-          make defconfig
-
-      - name: Compile module
-        run: |
-          cd openwrt-src
-          make target/linux/compile V=s -j$(nproc)
-          make package/kmod-amneziawg/{clean,compile} V=s -j$(nproc)
-
-      - name: Upload module IPK
-        uses: actions/upload-artifact@v4
-        with:
-          name: amneziawg-ipk
-          path: openwrt-src/bin/targets/*/*/packages/kmod-amneziawg_*.ipk
-
-  release:
-    name: Release on Tag ${{ github.ref_name }}
-    needs: build-module
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
     strategy:
       matrix:
-        env:
+        build_env:
           - tag: "24.10.0"
             pkgarch: mipsel_24kc
             target: ramips
@@ -60,42 +27,98 @@ jobs:
             vermagic: "3abe85def815b59c6c75ac1f92135cb6-r1"
 
     steps:
-      - name: Checkout openwrt/openwrt@${{ matrix.env.tag }}
+      - name: Checkout OpenWRT sources
         uses: actions/checkout@v4
         with:
           repository: openwrt/openwrt
-          ref: v${{ matrix.env.tag }}
+          ref: v${{ matrix.build_env.tag }}
           fetch-depth: 0
 
-      - name: Setup feeds & config
+      - name: Cache Tools and Kernel
+        id: cache-tools-kernel
+        uses: actions/cache@v4
+        env:
+          cache-name: "cache-tools-kernel-${{ matrix.build_env.tag }}-${{ matrix.build_env.pkgarch }}-${{ matrix.build_env.target }}-${{ matrix.build_env.subtarget }}"
+        with:
+          path: "**"
+          key: ${{ runner.os }}-build-vm4-${{ env.cache-name }}
+          restore-keys: |
+            ${{ runner.os }}-build-vm4-cache-tools-kernel-${{ matrix.build_env.tag }}-${{ matrix.build_env.pkgarch }}-
+
+      - name: Building kernel and tools
         run: |
-          wget https://downloads.openwrt.org/releases/${{ matrix.env.tag }}/targets/${{ matrix.env.target}}/${{ matrix.env.subtarget}}/feeds.buildinfo -O feeds.conf
-          echo "src-git awgopenwrt https://github.com/BlastOff313/awg-openwrt.git" >> feeds.conf
-          ./scripts/feeds update -a && ./scripts/feeds install -a
-          wget https://downloads.openwrt.org/releases/${{ matrix.env.tag }}/targets/${{ matrix.env.target}}/${{ matrix.env.subtarget}}/config.buildinfo -O .config
-          cat ../.config-custom >> .config
+          echo "pkgarch: ${{ matrix.build_env.pkgarch }}, target:${{ matrix.build_env.target }}, subtarget: ${{ matrix.build_env.subtarget }}"
+
+          # Setup & install feeds
+          wget https://downloads.openwrt.org/releases/${{ matrix.build_env.tag }}/targets/${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }}/feeds.buildinfo -O feeds.conf
+          echo "src-git awgopenwrt https://github.com/yury-sannikov/awg-openwrt.git" >> ./feeds.conf
+          ./scripts/feeds update && ./scripts/feeds install -a
+
+          # Setup config with AWG and dependencies
+          wget https://downloads.openwrt.org/releases/${{ matrix.build_env.tag }}/targets/${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }}/config.buildinfo -O .config
+          echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-crypto-lib-chacha20=m" >> .config
+          echo "CONFIG_PACKAGE_kmod-crypto-lib-chacha20poly1305=m" >> .config
+          echo "CONFIG_PACKAGE_kmod-crypto-chacha20poly1305=m" >> .config
+
           make defconfig
 
-      - name: Full build (tools, toolchain, kernel, packages)
+          echo "    > make tools/install"
+          make tools/install -i -j "$(nproc)"
+
+          cat ./build_dir/target-*/linux-*/linux-*/.vermagic || true
+
+          echo "    > make toolchain/install"
+          make toolchain/install -i -j "$(nproc)"
+
+          cat ./build_dir/target-*/linux-*/linux-*/.vermagic || true
+
+          # compile kernel module
+          echo "    > make target/linux/compile"
+          make target/linux/compile -i -j "$(nproc)" V=s
+
+          VERMAGIC=$(cat ./build_dir/target-*/linux-*/linux-*/.vermagic)
+          VERMAGIC_EXPECTED=${{ matrix.build_env.vermagic }}
+
+          if [ "$VERMAGIC" != "$VERMAGIC_EXPECTED" ]; then
+            echo "Vermagic mismatch: $VERMAGIC, expected $VERMAGIC_EXPECTED"
+            exit 1
+          fi
+
+      - name: Build AmneziaWG
         run: |
-          make tools/install toolchain/install target/linux/compile V=s -j$(nproc)
-          make package/kmod-amneziawg/{clean,compile} \
-               package/luci-app-amneziawg/{clean,compile} \
-               package/amneziawg-tools/{clean,compile} V=s -j$(nproc)
+          VERMAGIC=$(cat ./build_dir/target-*/linux-*/linux-*/.vermagic)
+          echo "Vermagic: $VERMAGIC"
+
+          VERMAGIC_EXPECTED=${{ matrix.build_env.vermagic }}
+
+          if [ "$VERMAGIC" != "$VERMAGIC_EXPECTED" ]; then
+            echo "Vermagic mismatch: $VERMAGIC, expected $VERMAGIC_EXPECTED"
+            exit 1
+          fi
+
+          # Ignore kmod build for some targets, replace with the awg-go
+          make package/kmod-amneziawg/{clean,download,prepare} V=s || true
+          make package/kmod-amneziawg/compile V=s || true
+
+          make package/luci-app-amneziawg/{clean,download,prepare}
+          make package/luci-app-amneziawg/compile V=s
+
+          make V=s package/amneziawg-tools/{clean,download,prepare}
+          make V=s package/amneziawg-tools/compile
 
       - name: Prepare artifacts
         run: |
-          mkdir -p release-artifacts
-          cp bin/packages/${{ matrix.env.pkgarch }}/awgopenwrt/*.ipk release-artifacts/
+          tag_name=${{ github.ref_name }}
+          mkdir -p awgrelease
+          postfix="${tag_name}_v${{ matrix.build_env.tag }}_${{ matrix.build_env.pkgarch }}_${{ matrix.build_env.target }}_${{ matrix.build_env.subtarget }}"
+          cp bin/packages/${{ matrix.build_env.pkgarch }}/awgopenwrt/amneziawg-tools_*.ipk awgrelease/amneziawg-tools_${postfix}.ipk
+          cp bin/packages/${{ matrix.build_env.pkgarch }}/awgopenwrt/luci-app-amneziawg_*.ipk awgrelease/luci-app-amneziawg_${postfix}.ipk
+          cp bin/targets/${{ matrix.build_env.target }}/${{ matrix.build_env.subtarget }}/packages/kmod-amneziawg_*.ipk awgrelease/kmod-amneziawg_${postfix}.ipk
 
-      - name: Create GitHub Release
-        id: gh
+      - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name }}
-
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: release-artifacts/*.ipk
+          files: awgrelease/*.ipk
